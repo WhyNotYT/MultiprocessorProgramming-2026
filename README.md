@@ -149,6 +149,8 @@ Additional minor changes: `native_rsqrt` instead of `sqrt`/division, `fma` for c
 
 Instead of targeting ODROID, the optional phase was implemented as a browser-based WebGPU compute pipeline running on the GPU via Chromium's Vulkan backend.
 
+Demo: https://whynotyt.github.io/znccwebgpu/
+
 ![alt text](image.png)
 
 The WGSL shader ports all three optimizations from the OpenCL version.

@@ -1,3 +1,7 @@
+// GPU stereo depth map using OpenCL
+// Offloads all processing to GPU: resize, grayscale, ZNCC, cross-check, occlusion fill
+// Picks NVIDIA GPU by default, set USE_IGPU=1 to use integrated GPU instead
+
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -21,6 +25,7 @@ constexpr int WIN_SIZE = 9;
 constexpr int MAX_DISP = 65;
 constexpr int CROSSCHECK_THRESH = 8;
 
+// helper macro to check OpenCL errors and exit on failure
 #define CL_CHECK(err, msg)                            \
     do                                                \
     {                                                 \
@@ -32,6 +37,7 @@ constexpr int CROSSCHECK_THRESH = 8;
         }                                             \
     } while (0)
 
+// read a text file (used to load the kernel source)
 static std::string LoadFile(const std::string &path)
 {
     std::ifstream f(path);
@@ -42,6 +48,7 @@ static std::string LoadFile(const std::string &path)
     return ss.str();
 }
 
+// compile OpenCL source and print build log on error
 static cl_program BuildProgram(cl_context ctx, cl_device_id dev,
                                const std::string &src)
 {
@@ -65,6 +72,7 @@ static cl_program BuildProgram(cl_context ctx, cl_device_id dev,
     return prog;
 }
 
+// scale disparity to 0-255 and save as PNG
 static void SaveNormalized(const std::string &filename,
                            const std::vector<uint8_t> &data,
                            int width, int height)
@@ -99,6 +107,7 @@ int main(int argc, char *argv[])
 
     cl_int err;
 
+    // enumerate all platforms and find the right GPU
     cl_uint num_platforms = 0;
     clGetPlatformIDs(0, nullptr, &num_platforms);
     std::vector<cl_platform_id> platforms(num_platforms);
@@ -151,10 +160,12 @@ int main(int argc, char *argv[])
     cl_context ctx = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
     CL_CHECK(err, "clCreateContext");
 
+    // profiling enabled so we can measure per-kernel times
     cl_command_queue queue = clCreateCommandQueue(ctx, device,
                                                   CL_QUEUE_PROFILING_ENABLE, &err);
     CL_CHECK(err, "clCreateCommandQueue");
 
+    // load and compile all kernels from file
     std::string src = LoadFile("kernels.old.cl");
     cl_program prog = BuildProgram(ctx, device, src);
 
@@ -171,6 +182,7 @@ int main(int argc, char *argv[])
 
     auto start_transfer_in = std::chrono::high_resolution_clock::now();
 
+    // upload full-res images to GPU as 2D image objects (enables hardware sampling)
     cl_image_format fmt_rgba = {CL_RGBA, CL_UNSIGNED_INT8};
     cl_image_desc desc_full = {CL_MEM_OBJECT_IMAGE2D, W, H};
 
@@ -182,6 +194,7 @@ int main(int argc, char *argv[])
     clFinish(queue);
     auto end_transfer_in = std::chrono::high_resolution_clock::now();
 
+    // allocate small (downscaled) images and intermediate buffers on GPU
     cl_image_desc desc_small = {CL_MEM_OBJECT_IMAGE2D, (size_t)nw, (size_t)nh};
     cl_mem img0_small = clCreateImage(ctx, CL_MEM_READ_WRITE, &fmt_rgba, &desc_small, nullptr, &err);
     cl_mem img1_small = clCreateImage(ctx, CL_MEM_READ_WRITE, &fmt_rgba, &desc_small, nullptr, &err);
@@ -192,6 +205,7 @@ int main(int argc, char *argv[])
     cl_mem buf_cc = clCreateBuffer(ctx, CL_MEM_READ_WRITE, small_px, nullptr, &err);
     cl_mem buf_out = clCreateBuffer(ctx, CL_MEM_READ_WRITE, small_px, nullptr, &err);
 
+    // initialize disparity buffers to zero
     uint8_t zero = 0;
     clEnqueueFillBuffer(queue, buf_dl, &zero, sizeof(uint8_t), 0, small_px, 0, nullptr, nullptr);
     clEnqueueFillBuffer(queue, buf_dr, &zero, sizeof(uint8_t), 0, small_px, 0, nullptr, nullptr);
@@ -201,6 +215,7 @@ int main(int argc, char *argv[])
     size_t gs2d[2] = {(size_t)nw, (size_t)nh};
     cl_event ev[7] = {};
 
+    // resize both images
     clSetKernelArg(k_resize, 0, sizeof(cl_mem), &img0_full);
     clSetKernelArg(k_resize, 1, sizeof(cl_mem), &img0_small);
     clEnqueueNDRangeKernel(queue, k_resize, 2, nullptr, gs2d, nullptr, 0, nullptr, &ev[0]);
@@ -208,6 +223,7 @@ int main(int argc, char *argv[])
     clSetKernelArg(k_resize, 1, sizeof(cl_mem), &img1_small);
     clEnqueueNDRangeKernel(queue, k_resize, 2, nullptr, gs2d, nullptr, 0, nullptr, &ev[1]);
 
+    // convert both to grayscale
     clSetKernelArg(k_gray, 0, sizeof(cl_mem), &img0_small);
     clSetKernelArg(k_gray, 1, sizeof(cl_mem), &buf_gray0);
     clSetKernelArg(k_gray, 2, sizeof(int), &nw);
@@ -217,6 +233,7 @@ int main(int argc, char *argv[])
     clSetKernelArg(k_gray, 2, sizeof(int), &nw);
     clEnqueueNDRangeKernel(queue, k_gray, 2, nullptr, gs2d, nullptr, 0, nullptr, &ev[3]);
 
+    // ZNCC: compute both left and right disparity maps in one kernel
     const int win_half = WIN_SIZE / 2;
     const int max_disp = MAX_DISP;
     clSetKernelArg(k_zncc, 0, sizeof(cl_mem), &buf_gray0);
@@ -229,6 +246,7 @@ int main(int argc, char *argv[])
     clSetKernelArg(k_zncc, 7, sizeof(int), &max_disp);
     clEnqueueNDRangeKernel(queue, k_zncc, 2, nullptr, gs2d, nullptr, 0, nullptr, &ev[4]);
 
+    // cross-check: zero out inconsistent disparities
     const int cc_thresh = CROSSCHECK_THRESH;
     clSetKernelArg(k_cc, 0, sizeof(cl_mem), &buf_dl);
     clSetKernelArg(k_cc, 1, sizeof(cl_mem), &buf_dr);
@@ -238,6 +256,7 @@ int main(int argc, char *argv[])
     clSetKernelArg(k_cc, 5, sizeof(int), &cc_thresh);
     clEnqueueNDRangeKernel(queue, k_cc, 2, nullptr, gs2d, nullptr, 0, nullptr, &ev[5]);
 
+    // occlusion fill: one thread per row to fill holes
     size_t gs1d[1] = {(size_t)nh};
     clSetKernelArg(k_fill, 0, sizeof(cl_mem), &buf_cc);
     clSetKernelArg(k_fill, 1, sizeof(cl_mem), &buf_out);
@@ -250,6 +269,7 @@ int main(int argc, char *argv[])
 
     auto start_transfer_out = std::chrono::high_resolution_clock::now();
 
+    // read result back to CPU
     std::vector<uint8_t> result(small_px);
     CL_CHECK(clEnqueueReadBuffer(queue, buf_out, CL_TRUE, 0, small_px, result.data(), 0, nullptr, nullptr), "read result");
 
@@ -269,6 +289,7 @@ int main(int argc, char *argv[])
         "  Occlusion fill     ",
     };
 
+    // print per-kernel timing using OpenCL profiling events
     std::cout << "\nTimings:\n";
     std::cout << "  CPU -> GPU transfer: " << d_in.count() << " ms\n";
     for (int i = 0; i < 7; ++i)
@@ -286,6 +307,7 @@ int main(int argc, char *argv[])
     SaveNormalized("depthmap_opencl.png", result, nw, nh);
     std::cout << "Result saved" << std::endl;
 
+    // cleanup
     clReleaseMemObject(img0_full);
     clReleaseMemObject(img1_full);
     clReleaseMemObject(img0_small);

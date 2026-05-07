@@ -1,30 +1,24 @@
 /// <reference types="@webgpu/types" />
 import shaderCode from "./zncc.wgsl?raw";
 
-// ---------------------------------------------------------------------------
-// Constants  (must match the WGSL)
-// ---------------------------------------------------------------------------
+// these must match the values in the WGSL shader
 const WIN_SIZE = 9; // must be odd; win_half = WIN_SIZE/2 = 4
 const MAX_DISP = 65;
 const CROSSCHECK_THRESH = 8;
 const DOWNSCALE = 4;
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+// return type for runZncc
 export type ZnccResult = {
   width: number;
   height: number;
-  disparity: Uint8Array; // final (cross-checked + filled)
-  disparityLeftRaw: Uint8Array; // raw left disparity before cross-check
+  disparity: Uint8Array; // final disparity after cross-check + fill
+  disparityLeftRaw: Uint8Array; // left disparity before cross-check
   nonZeroCount: number;
   nonZeroRawLeftCount: number;
   elapsedMs: number;
 };
 
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
+// throws if WebGPU isn't available or we're not in a secure context
 function assertWebGpu(): GPU {
   if (!("gpu" in navigator)) {
     throw new Error(
@@ -38,6 +32,7 @@ function assertWebGpu(): GPU {
   return navigator.gpu;
 }
 
+// creates a GPU buffer usable as storage + copy src/dst
 function createStorageBuffer(
   device: GPUDevice,
   byteLength: number,
@@ -53,23 +48,7 @@ function createStorageBuffer(
   });
 }
 
-// ---------------------------------------------------------------------------
-// Stage labels (must stay in sync with dispatch order below)
-// ---------------------------------------------------------------------------
-const STAGE_LABELS = [
-  "CPU → GPU transfer",
-  "grayscale",
-  "zncc left",
-  "zncc right",
-  "cross_check",
-  "occlusion_fill pass 1",
-  "occlusion_fill pass 2",
-  "GPU → CPU transfer",
-] as const;
-
-// ---------------------------------------------------------------------------
-// runZncc
-// ---------------------------------------------------------------------------
+// main entry point - runs the full ZNCC stereo pipeline on the GPU
 export async function runZncc(
   leftImage: ImageData,
   rightImage: ImageData,
@@ -95,19 +74,18 @@ export async function runZncc(
     );
   }
 
-
-  // Log adapter info — adapter.info is the current spec (Chrome 121+).
-  // adapter.requestAdapterInfo() was removed in newer builds.
+  // adapter.info is the current spec (Chrome 121+); requestAdapterInfo() was removed
   const adapterInfo: GPUAdapterInfo =
-    (adapter as any).info ?? (await (adapter as any).requestAdapterInfo?.()) ?? {} as GPUAdapterInfo;
+    (adapter as any).info ??
+    (await (adapter as any).requestAdapterInfo?.()) ??
+    ({} as GPUAdapterInfo);
   console.log(
     `[WebGPU] adapter: ${adapterInfo.description || adapterInfo.device || "(unknown)"}` +
-    ` | vendor: ${adapterInfo.vendor || "—"}` +
-    ` | arch: ${adapterInfo.architecture || "—"}`,
+      ` | vendor: ${adapterInfo.vendor || "—"}` +
+      ` | arch: ${adapterInfo.architecture || "—"}`,
   );
 
-  // We use 9 storage buffers per stage (WebGPU default limit is 8).
-  // We also request timestamp-query for per-pass GPU timing.
+  // need 9 storage buffers per stage (default limit is 8), also request timestamps if supported
   const supportsTimestamps = adapter.features.has("timestamp-query");
   const device = await adapter.requestDevice({
     requiredLimits: {
@@ -124,14 +102,9 @@ export async function runZncc(
   const height = Math.floor(srcHeight / DOWNSCALE);
   const pixelCount = width * height;
 
-  // ---------------------------------------------------------------------------
-  // Timestamp query setup
-  // ---------------------------------------------------------------------------
-  // We place a begin/end timestamp around each compute pass.
-  // Passes: grayscale, znccLeft, znccRight, crossCheck, fillPass1, fillPass2
-  // That's 6 passes × 2 timestamps = 12 slots.
+  // 6 passes x 2 timestamps each (begin + end) = 12 slots
   const NUM_PASSES = 6;
-  const NUM_TIMESTAMPS = NUM_PASSES * 2; // begin + end per pass
+  const NUM_TIMESTAMPS = NUM_PASSES * 2;
 
   let querySet: GPUQuerySet | null = null;
   let tsResolveBuffer: GPUBuffer | null = null;
@@ -152,9 +125,7 @@ export async function runZncc(
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // Upload source RGBA images — measure CPU→GPU transfer time
-  // ---------------------------------------------------------------------------
+  // upload both images to GPU and time the transfer
   const tCpuGpuStart = performance.now();
 
   const leftRgba = new Uint8Array(leftImage.data);
@@ -168,14 +139,14 @@ export async function runZncc(
   new Uint8Array(rightBuffer.getMappedRange()).set(rightRgba);
   rightBuffer.unmap();
 
-  // Flush the upload queue and wait so the transfer time is accurate.
+  // flush and wait so transfer time is accurate
   device.queue.submit([]);
   await device.queue.onSubmittedWorkDone();
 
   const tCpuGpuEnd = performance.now();
   const cpuGpuMs = tCpuGpuEnd - tCpuGpuStart;
 
-  // --- Intermediate / output buffers ---
+  // intermediate buffers for each stage of the pipeline
   const grayLeft = createStorageBuffer(device, pixelCount * 4);
   const grayRight = createStorageBuffer(device, pixelCount * 4);
   const dispLeft = createStorageBuffer(device, pixelCount * 4);
@@ -183,11 +154,10 @@ export async function runZncc(
   const checkedDisp = createStorageBuffer(device, pixelCount * 4);
   const outputDisp = createStorageBuffer(device, pixelCount * 4);
 
-  // OPT-A: scratch buffer for fill pass 1 → pass 2 handoff.
-  // 2 u32s per pixel: [fill_value, distance_to_source].
+  // scratch buffer for occlusion fill: stores [fill_value, distance] per pixel
   const fillScratch = createStorageBuffer(device, pixelCount * 2 * 4);
 
-  // --- Uniform params ---
+  // uniform params passed to the shader
   const paramsArray = new Uint32Array([
     width,
     height,
@@ -203,20 +173,22 @@ export async function runZncc(
   });
   device.queue.writeBuffer(paramsBuffer, 0, paramsArray);
 
-  // --- Shader module ---
+  // compile the WGSL shader
   const shaderModule = device.createShaderModule({ code: shaderCode });
 
-  // Check for compilation errors and surface them clearly.
+  // surface any shader compilation errors
   if (shaderModule.getCompilationInfo) {
     const info = await shaderModule.getCompilationInfo();
     const errors = info.messages.filter((m) => m.type === "error");
     if (errors.length > 0) {
-      const msg = errors.map((e) => `  line ${e.lineNum}: ${e.message}`).join("\n");
+      const msg = errors
+        .map((e) => `  line ${e.lineNum}: ${e.message}`)
+        .join("\n");
       throw new Error(`WGSL compilation failed:\n${msg}`);
     }
   }
 
-  // --- Bind group layout (10 bindings: 0-8 same as before + binding 9 = fillScratch) ---
+  // bind group layout - 10 bindings (0-8 standard + 9 for fillScratch)
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
       {
@@ -264,7 +236,7 @@ export async function runZncc(
         visibility: GPUShaderStage.COMPUTE,
         buffer: { type: "uniform" },
       },
-      // OPT-A: fill scratch buffer (binding 9 — requires maxStorageBuffersPerShaderStage: 9)
+      // fill scratch needs maxStorageBuffersPerShaderStage: 9
       {
         binding: 9,
         visibility: GPUShaderStage.COMPUTE,
@@ -277,14 +249,13 @@ export async function runZncc(
     bindGroupLayouts: [bindGroupLayout],
   });
 
-  // --- Pipelines ---
-  // grayscale: 16×16
+  // one pipeline per shader entry point
   const grayscalePipeline = device.createComputePipeline({
     layout: pipelineLayout,
     compute: { module: shaderModule, entryPoint: "grayscale" },
   });
 
-  // OPT-B + OPT-C: separate znccLeft and znccRight at 32×8
+  // zncc left and right use 32x8 workgroups
   const znccLeftPipeline = device.createComputePipeline({
     layout: pipelineLayout,
     compute: { module: shaderModule, entryPoint: "znccLeft" },
@@ -294,13 +265,12 @@ export async function runZncc(
     compute: { module: shaderModule, entryPoint: "znccRight" },
   });
 
-  // crossCheck: 16×16
   const crossCheckPipeline = device.createComputePipeline({
     layout: pipelineLayout,
     compute: { module: shaderModule, entryPoint: "crossCheck" },
   });
 
-  // OPT-A: two fill passes at 64×1
+  // two fill passes for occlusion filling
   const fillPass1Pipeline = device.createComputePipeline({
     layout: pipelineLayout,
     compute: { module: shaderModule, entryPoint: "fillPass1" },
@@ -310,7 +280,7 @@ export async function runZncc(
     compute: { module: shaderModule, entryPoint: "fillPass2" },
   });
 
-  // --- Bind group ---
+  // bind all buffers
   const bindGroup = device.createBindGroup({
     layout: bindGroupLayout,
     entries: [
@@ -323,14 +293,11 @@ export async function runZncc(
       { binding: 6, resource: { buffer: checkedDisp } },
       { binding: 7, resource: { buffer: outputDisp } },
       { binding: 8, resource: { buffer: paramsBuffer } },
-      { binding: 9, resource: { buffer: fillScratch } }, // OPT-A
+      { binding: 9, resource: { buffer: fillScratch } },
     ],
   });
 
-  // ---------------------------------------------------------------------------
-  // Helper: wrap a compute pass with optional timestamp begin/end
-  // passIndex: 0-based index into the 6 compute passes
-  // ---------------------------------------------------------------------------
+  // wraps a compute pass with optional GPU timestamp queries
   function timedPass(
     encoder: GPUCommandEncoder,
     passIndex: number,
@@ -352,53 +319,52 @@ export async function runZncc(
     pass.end();
   }
 
-  // --- Dispatch ---
   const tKernelStart = performance.now();
   const encoder = device.createCommandEncoder();
 
-  // 0. Grayscale + downscale  (16×16 WG)
+  // pass 0: grayscale + 4x downscale
   timedPass(encoder, 0, (pass) => {
     pass.setPipeline(grayscalePipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
   });
 
-  // 1. ZNCC left  (32×8 WG, OPT-B + OPT-C)
+  // pass 1: ZNCC left→right disparity
   timedPass(encoder, 1, (pass) => {
     pass.setPipeline(znccLeftPipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(Math.ceil(width / 32), Math.ceil(height / 8));
   });
 
-  // 2. ZNCC right  (32×8 WG, OPT-B + OPT-C)
+  // pass 2: ZNCC right→left disparity
   timedPass(encoder, 2, (pass) => {
     pass.setPipeline(znccRightPipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(Math.ceil(width / 32), Math.ceil(height / 8));
   });
 
-  // 3. Cross-check  (16×16 WG)
+  // pass 3: cross-check to remove inconsistent disparities
   timedPass(encoder, 3, (pass) => {
     pass.setPipeline(crossCheckPipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
   });
 
-  // 4. OPT-A: fill pass 1 – left→right  (64×1 WG, one thread per row)
+  // pass 4: fill occluded pixels scanning left→right
   timedPass(encoder, 4, (pass) => {
     pass.setPipeline(fillPass1Pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(Math.ceil(height / 64));
   });
 
-  // 5. OPT-A: fill pass 2 – right→left  (64×1 WG, one thread per row)
+  // pass 5: fill occluded pixels scanning right→left
   timedPass(encoder, 5, (pass) => {
     pass.setPipeline(fillPass2Pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(Math.ceil(height / 64));
   });
 
-  // Resolve timestamps into the resolve buffer before readback copies.
+  // resolve timestamps before we do readback copies
   if (querySet && tsResolveBuffer) {
     encoder.resolveQuerySet(querySet, 0, NUM_TIMESTAMPS, tsResolveBuffer, 0);
     if (tsReadbackBuffer) {
@@ -412,7 +378,7 @@ export async function runZncc(
     }
   }
 
-  // --- Readback ---
+  // copy results back to CPU-readable buffers
   const readbackOutput = device.createBuffer({
     size: pixelCount * 4,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
@@ -436,19 +402,18 @@ export async function runZncc(
   await Promise.all([
     readbackOutput.mapAsync(GPUMapMode.READ),
     readbackLeft.mapAsync(GPUMapMode.READ),
-    tsReadbackBuffer ? tsReadbackBuffer.mapAsync(GPUMapMode.READ) : Promise.resolve(),
+    tsReadbackBuffer
+      ? tsReadbackBuffer.mapAsync(GPUMapMode.READ)
+      : Promise.resolve(),
   ]);
 
-  // ---------------------------------------------------------------------------
-  // Parse GPU timestamps
-  // ---------------------------------------------------------------------------
+  // parse per-pass GPU times from timestamp buffer (values are in nanoseconds)
   const passGpuMs: number[] = new Array(NUM_PASSES).fill(0);
   if (supportsTimestamps && tsReadbackBuffer) {
     const tsData = new BigInt64Array(tsReadbackBuffer.getMappedRange());
     for (let i = 0; i < NUM_PASSES; i++) {
       const begin = tsData[i * 2];
-      const end   = tsData[i * 2 + 1];
-      // timestamps are in nanoseconds
+      const end = tsData[i * 2 + 1];
       passGpuMs[i] = Number(end - begin) / 1_000_000;
     }
     tsReadbackBuffer.unmap();
@@ -461,6 +426,7 @@ export async function runZncc(
   let nonZeroCount = 0;
   let nonZeroRawLeftCount = 0;
 
+  // extract u8 disparity values and count valid pixels
   for (let i = 0; i < pixelCount; i++) {
     disparity[i] = outputRaw[i] & 0xff;
     disparityLeftRaw[i] = leftRaw[i] & 0xff;
@@ -473,23 +439,37 @@ export async function runZncc(
 
   const totalMs = cpuGpuMs + kernelTotalMs;
 
-  // ---------------------------------------------------------------------------
-  // Print timing table
-  // ---------------------------------------------------------------------------
+  // print a timing table to the console
   const gpuKernelTotalMs = passGpuMs.reduce((a, b) => a + b, 0);
 
-  // Pass indices: 0=grayscale, 1=znccLeft, 2=znccRight, 3=crossCheck, 4=fill1, 5=fill2
   const rows: [string, string][] = [
-    ["CPU → GPU transfer",  `${cpuGpuMs.toFixed(6)} ms`],
-    ["grayscale",           supportsTimestamps ? `${passGpuMs[0].toFixed(6)} ms` : "n/a"],
-    ["zncc left",           supportsTimestamps ? `${passGpuMs[1].toFixed(6)} ms` : "n/a"],
-    ["zncc right",          supportsTimestamps ? `${passGpuMs[2].toFixed(6)} ms` : "n/a"],
-    ["cross_check",         supportsTimestamps ? `${passGpuMs[3].toFixed(6)} ms` : "n/a"],
-    ["occlusion_fill pass 1", supportsTimestamps ? `${passGpuMs[4].toFixed(6)} ms` : "n/a"],
-    ["occlusion_fill pass 2", supportsTimestamps ? `${passGpuMs[5].toFixed(6)} ms` : "n/a"],
-    ["GPU → CPU transfer",  `${gpuCpuMs.toFixed(6)} ms`],
-    ["**GPU kernels total**", supportsTimestamps ? `**${gpuKernelTotalMs.toFixed(4)} ms**` : `**${kernelTotalMs.toFixed(4)} ms** (wall)`],
-    ["**Total**",           `**${totalMs.toFixed(4)} ms**`],
+    ["CPU → GPU transfer", `${cpuGpuMs.toFixed(6)} ms`],
+    ["grayscale", supportsTimestamps ? `${passGpuMs[0].toFixed(6)} ms` : "n/a"],
+    ["zncc left", supportsTimestamps ? `${passGpuMs[1].toFixed(6)} ms` : "n/a"],
+    [
+      "zncc right",
+      supportsTimestamps ? `${passGpuMs[2].toFixed(6)} ms` : "n/a",
+    ],
+    [
+      "cross_check",
+      supportsTimestamps ? `${passGpuMs[3].toFixed(6)} ms` : "n/a",
+    ],
+    [
+      "occlusion_fill pass 1",
+      supportsTimestamps ? `${passGpuMs[4].toFixed(6)} ms` : "n/a",
+    ],
+    [
+      "occlusion_fill pass 2",
+      supportsTimestamps ? `${passGpuMs[5].toFixed(6)} ms` : "n/a",
+    ],
+    ["GPU → CPU transfer", `${gpuCpuMs.toFixed(6)} ms`],
+    [
+      "**GPU kernels total**",
+      supportsTimestamps
+        ? `**${gpuKernelTotalMs.toFixed(4)} ms**`
+        : `**${kernelTotalMs.toFixed(4)} ms** (wall)`,
+    ],
+    ["**Total**", `**${totalMs.toFixed(4)} ms**`],
   ];
 
   const colW = Math.max(...rows.map(([label]) => label.length));
@@ -522,9 +502,7 @@ export async function runZncc(
   };
 }
 
-// ---------------------------------------------------------------------------
-// disparityToImageData  (unchanged)
-// ---------------------------------------------------------------------------
+// converts a disparity array to a grayscale ImageData for display
 export function disparityToImageData(
   disparity: Uint8Array,
   width: number,

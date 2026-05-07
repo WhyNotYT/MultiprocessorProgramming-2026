@@ -1,3 +1,7 @@
+// Multi-threaded CPU stereo depth map using OpenMP
+// Same pipeline as single-threaded but parallelized across rows
+// Pass number of threads as argv[1] (optional)
+
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -20,6 +24,8 @@ struct ImageSize
 using GrayImage = std::vector<std::uint8_t>;
 using RGBAImage = std::vector<std::uint8_t>;
 
+// ZNCC stereo matching, parallelized over rows with dynamic scheduling
+// each pixel computes both left->right and right->left disparities
 void CalcZNCC(const GrayImage &left, const GrayImage &right,
               GrayImage &disp_left, GrayImage &disp_right,
               int width, int height)
@@ -30,6 +36,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
     const std::uint8_t *pLeft = left.data();
     const std::uint8_t *pRight = right.data();
 
+// dynamic scheduling because rows near the edges do less work (smaller search range)
 #pragma omp parallel for schedule(dynamic, 4) default(none)     \
     shared(pLeft, pRight, disp_left, disp_right, width, height) \
     firstprivate(win_half, inv_win_area, MAX_DISP)
@@ -37,7 +44,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
     {
         for (int x = win_half; x < width - win_half; ++x)
         {
-
+            // precompute left window mean
             float sum_l = 0.0f;
             for (int wy = -win_half; wy <= win_half; ++wy)
             {
@@ -47,6 +54,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
             }
             float mean_l = sum_l * inv_win_area;
 
+            // precompute left window std
             float sum_sq_l = 0.0f;
             for (int wy = -win_half; wy <= win_half; ++wy)
             {
@@ -59,6 +67,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
             }
             float std_l = std::sqrt(sum_sq_l);
 
+            // precompute right window stats at d=0 (reused for right->left search)
             float sum_r_base = 0.0f;
             for (int wy = -win_half; wy <= win_half; ++wy)
             {
@@ -80,6 +89,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
             }
             float std_r_base = std::sqrt(sum_sq_r_base);
 
+            // left->right disparity search
             float best_score_l = -1.0f;
             int best_disp_l = 0;
             int max_d_l = std::min(MAX_DISP, x - win_half);
@@ -119,6 +129,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
             }
             disp_left[y * width + x] = static_cast<std::uint8_t>(best_disp_l);
 
+            // right->left disparity search (from right image's perspective)
             float best_score_r = -1.0f;
             int best_disp_r = 0;
             int max_d_r = std::min(MAX_DISP, width - 1 - (x + win_half));
@@ -161,6 +172,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
     }
 }
 
+// zero out pixels where left and right disparity estimates are inconsistent
 void CrossCheck(const GrayImage &disp_left, const GrayImage &disp_right,
                 GrayImage &output, int width, int height)
 {
@@ -183,6 +195,7 @@ void CrossCheck(const GrayImage &disp_left, const GrayImage &disp_right,
     }
 }
 
+// fill invalid (zero) pixels with nearest valid neighbor on the same row
 void OcclusionFill(const GrayImage &input, GrayImage &output, int width, int height)
 {
 #pragma omp parallel for schedule(static) default(none) \
@@ -197,6 +210,7 @@ void OcclusionFill(const GrayImage &input, GrayImage &output, int width, int hei
             }
             else
             {
+                // search both directions and pick closest non-zero
                 std::uint8_t fill_val = 0;
                 for (int offset = 1; offset < width; ++offset)
                 {
@@ -217,6 +231,7 @@ void OcclusionFill(const GrayImage &input, GrayImage &output, int width, int hei
     }
 }
 
+// downscale by 4x and convert to grayscale, parallelized
 void ProcessImage(const RGBAImage &input_rgba, int w, int h, GrayImage &output_gray)
 {
     int nw = w / 4, nh = h / 4;
@@ -227,6 +242,7 @@ void ProcessImage(const RGBAImage &input_rgba, int w, int h, GrayImage &output_g
     {
         for (int x = 0; x < nw; ++x)
         {
+            // sample top-left of each 4x4 block in source
             int idx = ((y * 4 * w) + (x * 4)) * 4;
             float r = input_rgba[idx];
             float g = input_rgba[idx + 1];
@@ -237,6 +253,7 @@ void ProcessImage(const RGBAImage &input_rgba, int w, int h, GrayImage &output_g
     }
 }
 
+// normalize disparity values to 0-255 and save as PNG
 void SaveNormalizedImage(const std::string &filename,
                          const GrayImage &data, int width, int height)
 {
@@ -252,7 +269,7 @@ void SaveNormalizedImage(const std::string &filename,
 
 int main(int argc, char *argv[])
 {
-
+    // optionally override thread count from command line
     if (argc > 1)
     {
         int n = std::atoi(argv[1]);

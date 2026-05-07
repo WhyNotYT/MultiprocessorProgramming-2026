@@ -1,3 +1,8 @@
+// SIMD-optimized CPU stereo depth map using AVX2 + integral images
+// Key optimizations:
+//   - integral images make mean/std computation O(1) instead of O(win^2)
+//   - AVX2 vectorizes the cross-correlation inner loop
+
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -28,7 +33,7 @@ struct Timer
     }
 };
 
-// ─── horizontal sum of __m256 ─────────────────────────────────────────────────
+// horizontal sum of all 8 floats in a __m256 register
 static inline f32 hsum256(__m256 v)
 {
     __m128 lo = _mm256_castps256_ps128(v);
@@ -39,7 +44,8 @@ static inline f32 hsum256(__m256 v)
     return _mm_cvtss_f32(s);
 }
 
-// ─── resize + grayscale (fused, AVX2) ────────────────────────────────────────
+// fused resize (4x downsample) + grayscale conversion using AVX2
+// processes 8 output pixels per iteration
 void ResizeGray(const std::vector<u8> &src, int sw, int /*sh*/,
                 std::vector<f32> &dst, int dw, int dh)
 {
@@ -49,9 +55,10 @@ void ResizeGray(const std::vector<u8> &src, int sw, int /*sh*/,
 
     for (int dy = 0; dy < dh; ++dy)
     {
-        const u8 *row = src.data() + dy * 4 * sw * 4; // src stride = sw*4 bytes/row, 4 rows down
+        const u8 *row = src.data() + dy * 4 * sw * 4; // stride: 4 src rows, sw*4 bytes each
         f32 *out = dst.data() + dy * dw;
         int dx = 0;
+        // process 8 pixels at a time with AVX2
         for (; dx + 8 <= dw; dx += 8)
         {
             const u8 *p = row + dx * 16; // each src pixel is 4 bytes, sampled every 4 → stride 16
@@ -63,6 +70,7 @@ void ResizeGray(const std::vector<u8> &src, int sw, int /*sh*/,
                                                           _mm256_mul_ps(_mm256_cvtepi32_ps(bi), vB)));
             _mm256_storeu_ps(out + dx, gray);
         }
+        // handle leftover pixels
         for (; dx < dw; ++dx)
         {
             const u8 *p = row + dx * 16;
@@ -71,14 +79,13 @@ void ResizeGray(const std::vector<u8> &src, int sw, int /*sh*/,
     }
 }
 
-// ─── Integral images (sum and sum-of-squares) for O(1) window queries ─────────
-// Stored as double to avoid float overflow on sum-of-squares.
-// Layout: (height+1) × (width+1), row-major, top/left border = 0.
+// Integral image for O(1) rectangular window sums and sum-of-squares.
+// Using double to avoid overflow when squaring pixel values.
 struct IntegralImage
 {
-    std::vector<double> S;  // sum
-    std::vector<double> S2; // sum of squares
-    int W, H;               // padded dims = (img_w+1, img_h+1)
+    std::vector<double> S;  // prefix sum
+    std::vector<double> S2; // prefix sum of squares
+    int W, H;               // padded dimensions (img_w+1, img_h+1)
 
     void build(const std::vector<f32> &img, int w, int h)
     {
@@ -101,13 +108,14 @@ struct IntegralImage
         }
     }
 
-    // Rectangle sum: rows [r0,r1], cols [c0,c1]  (inclusive)
+    // sum over rectangle [r0,r1] x [c0,c1] using the 4-corner trick
     inline double rectSum(const std::vector<double> &T,
                           int r0, int c0, int r1, int c1) const
     {
         return T[(r1 + 1) * W + (c1 + 1)] - T[(r0)*W + (c1 + 1)] - T[(r1 + 1) * W + (c0)] + T[(r0)*W + (c0)];
     }
 
+    // sum over the WIN_SIZE x WIN_SIZE window centered at (cy, cx)
     inline double winSum(int cy, int cx) const
     {
         return rectSum(S, cy - WIN_HALF, cx - WIN_HALF, cy + WIN_HALF, cx + WIN_HALF);
@@ -118,12 +126,8 @@ struct IntegralImage
     }
 };
 
-// ─── ZNCC using integral images + AVX2 cross-correlation ─────────────────────
-//
-// Key insight: mean and stddev of BOTH windows are now O(1) via integral images.
-// The only remaining O(WIN²) work per (x,d) pair is the cross-correlation sum,
-// which we vectorize with AVX2.
-//
+// ZNCC stereo matching with integral images + AVX2 cross-correlation
+// mean/std are O(1) via integral images; cross-correlation inner loop uses AVX2
 void CalcZNCC(const std::vector<f32> &left, const std::vector<f32> &right,
               std::vector<u8> &disp_left, std::vector<u8> &disp_right,
               int width, int height)
@@ -136,7 +140,7 @@ void CalcZNCC(const std::vector<f32> &left, const std::vector<f32> &right,
     {
         for (int x = WIN_HALF; x < width - WIN_HALF; ++x)
         {
-            // ── left window stats (O(1)) ──────────────────────────────────
+            // left window stats in O(1) using integral image
             double sumL = iiL.winSum(y, x);
             double sumL2 = iiL.winSum2(y, x);
             f32 meanL = (f32)(sumL / WIN_AREA);
@@ -144,7 +148,7 @@ void CalcZNCC(const std::vector<f32> &left, const std::vector<f32> &right,
             f32 stdL = (varL > 0.f) ? std::sqrt(varL) : 0.f;
             __m256 vML = _mm256_set1_ps(meanL);
 
-            // ── left→right search ─────────────────────────────────────────
+            // left->right disparity search
             f32 best_l = -2.f;
             int bd_l = 0;
             int max_d_l = std::min(MAX_DISP, x - WIN_HALF);
@@ -157,12 +161,12 @@ void CalcZNCC(const std::vector<f32> &left, const std::vector<f32> &right,
                 f32 meanR = (f32)(sumR / WIN_AREA);
                 f32 varR = (f32)(sumR2 / WIN_AREA - (double)meanR * meanR);
                 f32 stdR = (varR > 0.f) ? std::sqrt(varR) : 0.f;
-                f32 den = stdL * stdR * WIN_AREA; // denominator
+                f32 den = stdL * stdR * WIN_AREA;
 
                 if (den < 0.0001f)
                     continue;
 
-                // Cross-correlation inner loop (AVX2)
+                // AVX2 cross-correlation: process 8 elements at a time
                 __m256 vMR = _mm256_set1_ps(meanR);
                 __m256 vacc = _mm256_setzero_ps();
                 f32 cross = 0.f;
@@ -178,6 +182,7 @@ void CalcZNCC(const std::vector<f32> &left, const std::vector<f32> &right,
                         __m256 dr = _mm256_sub_ps(_mm256_loadu_ps(rowR + wx), vMR);
                         vacc = _mm256_fmadd_ps(dl, dr, vacc);
                     }
+                    // handle remainder
                     for (; wx < WIN_SIZE; ++wx)
                         cross += (rowL[wx] - meanL) * (rowR[wx] - meanR);
                 }
@@ -192,7 +197,7 @@ void CalcZNCC(const std::vector<f32> &left, const std::vector<f32> &right,
             }
             disp_left[y * width + x] = (u8)bd_l;
 
-            // ── right window stats (O(1)) ─────────────────────────────────
+            // right window stats in O(1)
             double sumRb = iiR.winSum(y, x);
             double sumRb2 = iiR.winSum2(y, x);
             f32 meanRb = (f32)(sumRb / WIN_AREA);
@@ -200,7 +205,7 @@ void CalcZNCC(const std::vector<f32> &left, const std::vector<f32> &right,
             f32 stdRb = (varRb > 0.f) ? std::sqrt(varRb) : 0.f;
             __m256 vMRb = _mm256_set1_ps(meanRb);
 
-            // ── right→left search ─────────────────────────────────────────
+            // right->left disparity search
             f32 best_r = -2.f;
             int bd_r = 0;
             int max_d_r = std::min(MAX_DISP, width - 1 - (x + WIN_HALF));
@@ -250,7 +255,7 @@ void CalcZNCC(const std::vector<f32> &left, const std::vector<f32> &right,
     }
 }
 
-// ─── cross-check ─────────────────────────────────────────────────────────────
+// zero out pixels where left/right disparities disagree
 void CrossCheck(const std::vector<u8> &dl, const std::vector<u8> &dr,
                 std::vector<u8> &out, int width, int height)
 {
@@ -264,11 +269,12 @@ void CrossCheck(const std::vector<u8> &dl, const std::vector<u8> &dr,
         }
 }
 
-// ─── occlusion fill (two-pass, branch-free inner loop) ───────────────────────
+// fill invalid pixels using two-pass approach: left->right then right->left
+// more efficient than the single-pass version since it avoids searching
 void OcclusionFill(const std::vector<u8> &input, std::vector<u8> &output,
                    int width, int height)
 {
-    // Pass 1: left→right
+    // pass 1: propagate valid values left to right
     for (int y = 0; y < height; ++y)
     {
         const u8 *in = input.data() + y * width;
@@ -281,7 +287,7 @@ void OcclusionFill(const std::vector<u8> &input, std::vector<u8> &output,
             out[x] = in[x] ? in[x] : last;
         }
     }
-    // Pass 2: right→left (only fix remaining zeros)
+    // pass 2: fill any remaining zeros by propagating right to left
     for (int y = 0; y < height; ++y)
     {
         u8 *out = output.data() + y * width;
@@ -296,7 +302,7 @@ void OcclusionFill(const std::vector<u8> &input, std::vector<u8> &output,
     }
 }
 
-// ─── save ─────────────────────────────────────────────────────────────────────
+// normalize to 0-255 and save as PNG
 void SaveNormalized(const std::string &fn, const std::vector<u8> &data, int w, int h)
 {
     std::vector<u8> rgba(w * h * 4);
@@ -309,7 +315,6 @@ void SaveNormalized(const std::string &fn, const std::vector<u8> &data, int w, i
     lodepng::encode(fn, rgba, w, h);
 }
 
-// ─── main ─────────────────────────────────────────────────────────────────────
 int main()
 {
     std::vector<u8> img0, img1;
@@ -323,12 +328,14 @@ int main()
     int nw = (int)w / 4, nh = (int)h / 4;
     size_t n = (size_t)nw * nh;
 
+    // use float for grayscale to work with AVX2 and integral images
     std::vector<f32> gray0(n), gray1(n);
     std::vector<u8> d_left(n, 0), d_right(n, 0), d_cc(n, 0), d_final(n, 0);
 
     std::cout << "Started\n";
     Timer t;
     double total = 0;
+    // lambda to time and print each stage
     auto stage = [&](const char *name, auto fn)
     {
         t.start();

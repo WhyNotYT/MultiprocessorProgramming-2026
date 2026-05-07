@@ -1,7 +1,12 @@
+// OpenCL kernels for stereo depth map pipeline
+// Includes: resize, grayscale, gaussian filter, ZNCC, cross-check, occlusion fill
+
+// sampler for reading images: no normalization, clamp edges, nearest-neighbor
 __constant sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE | 
                                CLK_ADDRESS_CLAMP_TO_EDGE | 
                                CLK_FILTER_NEAREST;
 
+// downscale image by 4x - each output pixel reads from (x*4, y*4) in the source
 __kernel void resize_image(__read_only  image2d_t input_image,
                            __write_only image2d_t output_image)
 {
@@ -12,6 +17,8 @@ __kernel void resize_image(__read_only  image2d_t input_image,
     uint4 pixel = read_imageui(input_image, sampler, input_coord);
     write_imageui(output_image, (int2)(x, y), pixel);
 }
+
+// convert RGBA image to grayscale using standard luminance weights
 __kernel void convert_grayscale(__read_only image2d_t input_image,
                                 __global uchar *output_buffer,
                                 int width)
@@ -23,6 +30,8 @@ __kernel void convert_grayscale(__read_only image2d_t input_image,
     float gray  = 0.2126f * pixel.x + 0.7152f * pixel.y + 0.0722f * pixel.z;
     output_buffer[y * width + x] = (uchar)gray;
 }
+
+// 5x5 gaussian blur (sum/256 normalization, not actually used in the main pipeline)
 __kernel void apply_filter(__global const uchar *input,
                            __global uchar *output,
                            int width,
@@ -31,6 +40,7 @@ __kernel void apply_filter(__global const uchar *input,
     int x = get_global_id(0);
     int y = get_global_id(1);
 
+    // gaussian kernel weights (sum = 256)
     const int kernel_weights[25] = {
         1,  4,  6,  4, 1,
         4, 16, 24, 16, 4,
@@ -48,12 +58,14 @@ __kernel void apply_filter(__global const uchar *input,
                 k_idx++;
             }
         }
-        output[y * width + x] = (uchar)(sum >> 8);
+        output[y * width + x] = (uchar)(sum >> 8); // divide by 256
     } else {
-        output[y * width + x] = input[y * width + x];
+        output[y * width + x] = input[y * width + x]; // border: copy as-is
     }
 }
 
+// ZNCC stereo matching - computes both left->right and right->left disparities
+// each thread handles one pixel and searches through all disparities
 __kernel void zncc(__global const uchar *left,
                    __global const uchar *right,
                    __global uchar       *disp_left,
@@ -66,12 +78,14 @@ __kernel void zncc(__global const uchar *left,
     int x = (int)get_global_id(0);
     int y = (int)get_global_id(1);
 
+    // skip border pixels where the window would go out of bounds
     if (x < win_half || x >= width  - win_half ||
         y < win_half || y >= height - win_half)
         return;
 
     const float inv_win = 1.0f / (float)((2*win_half+1) * (2*win_half+1));
 
+    // compute left window mean
     float sum_l = 0.0f;
     for (int wy = -win_half; wy <= win_half; wy++) {
         int row = (y + wy) * width;
@@ -80,6 +94,7 @@ __kernel void zncc(__global const uchar *left,
     }
     float mean_l = sum_l * inv_win;
 
+    // compute left window std
     float ssq_l = 0.0f;
     for (int wy = -win_half; wy <= win_half; wy++) {
         int row = (y + wy) * width;
@@ -90,6 +105,7 @@ __kernel void zncc(__global const uchar *left,
     }
     float std_l = sqrt(ssq_l);
 
+    // precompute right window stats at d=0 (used for right->left search)
     float sum_r_base = 0.0f;
     for (int wy = -win_half; wy <= win_half; wy++) {
         int row = (y + wy) * width;
@@ -108,6 +124,7 @@ __kernel void zncc(__global const uchar *left,
     }
     float std_r_base = sqrt(ssq_r_base);
 
+    // left->right: find best matching disparity
     float best_l = -1.0f;
     int   bd_l   = 0;
     int   lim_l  = min(max_disp, x - win_half);
@@ -138,6 +155,7 @@ __kernel void zncc(__global const uchar *left,
     }
     disp_left[y * width + x] = (uchar)bd_l;
 
+    // right->left: find best matching disparity
     float best_r = -1.0f;
     int   bd_r   = 0;
     int   lim_r  = min(max_disp, width - 1 - (x + win_half));
@@ -169,6 +187,7 @@ __kernel void zncc(__global const uchar *left,
     disp_right[y * width + x] = (uchar)bd_r;
 }
 
+// zero out pixels where left and right disparities don't agree
 __kernel void cross_check(__global const uchar *disp_left,
                           __global const uchar *disp_right,
                           __global uchar       *output,
@@ -190,6 +209,8 @@ __kernel void cross_check(__global const uchar *disp_left,
         (diff < -threshold || diff > threshold) ? 0 : (uchar)dl;
 }
 
+// fill invalid (zero) pixels with nearest non-zero neighbor on the same row
+// one thread per row, sequential within each row
 __kernel void occlusion_fill(__global const uchar *input,
                              __global uchar       *output,
                              int width,
@@ -202,6 +223,7 @@ __kernel void occlusion_fill(__global const uchar *input,
         if (input[y * width + x] != 0) {
             output[y * width + x] = input[y * width + x];
         } else {
+            // search left and right alternately for nearest valid pixel
             uchar fill = 0;
             for (int off = 1; off < width; off++) {
                 if (x - off >= 0 && input[y * width + (x - off)] != 0) {

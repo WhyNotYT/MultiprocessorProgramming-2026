@@ -1,3 +1,7 @@
+// Single-threaded CPU stereo depth map
+// Loads two images, downscales, converts to grayscale,
+// runs ZNCC matching, cross-checks, fills holes, saves result
+
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -6,9 +10,9 @@
 #include <cstdint>
 #include "lodepng.h"
 
-constexpr int WIN_SIZE = 9;
-constexpr int MAX_DISP = 65;
-constexpr int CROSSCHECK_THRESHOLD = 8;
+constexpr int WIN_SIZE = 9;             // matching window size (9x9)
+constexpr int MAX_DISP = 65;            // max disparity to search
+constexpr int CROSSCHECK_THRESHOLD = 8; // max allowed difference between left/right disparities
 
 struct ImageSize
 {
@@ -19,6 +23,7 @@ struct ImageSize
 using GrayImage = std::vector<std::uint8_t>;
 using RGBAImage = std::vector<std::uint8_t>;
 
+// ZNCC stereo matching - for each pixel finds best matching disparity in both directions
 void CalcZNCC(const GrayImage &left, const GrayImage &right,
               GrayImage &disp_left, GrayImage &disp_right,
               int width, int height)
@@ -33,7 +38,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
     {
         for (int x = win_half; x < width - win_half; ++x)
         {
-            // precalcualte window stats
+            // compute mean and std of the left window at (x, y)
             float sum_l = 0;
             for (int wy = -win_half; wy <= win_half; ++wy)
             {
@@ -57,7 +62,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
             }
             float std_l = std::sqrt(sum_sq_diff_l);
 
-            // left right search
+            // left->right: try each disparity and pick the best ZNCC score
             float best_score_l = -1.0f;
             int best_disp_l = 0;
             int max_d_l = std::min(MAX_DISP, x - win_half);
@@ -101,7 +106,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
             }
             disp_left[y * width + x] = static_cast<std::uint8_t>(best_disp_l);
 
-            // precalculate window states
+            // right->left: same thing but from the right image's perspective
             float sum_r_base = 0;
             for (int wy = -win_half; wy <= win_half; ++wy)
             {
@@ -125,7 +130,6 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
             }
             float std_r_base = std::sqrt(sum_sq_diff_r_base);
 
-            // Right left search
             float best_score_r = -1.0f;
             int best_disp_r = 0;
             int max_d_r = std::min(MAX_DISP, width - 1 - (x + win_half));
@@ -174,6 +178,7 @@ void CalcZNCC(const GrayImage &left, const GrayImage &right,
     }
 }
 
+// removes pixels where left and right disparities disagree too much
 void CrossCheck(const GrayImage &disp_left, const GrayImage &disp_right, GrayImage &output, int width, int height)
 {
     for (int y = 0; y < height; ++y)
@@ -184,11 +189,13 @@ void CrossCheck(const GrayImage &disp_left, const GrayImage &disp_right, GrayIma
             int x_right = x - dl;
             int dr = (x_right >= 0 && x_right < width) ? disp_right[y * width + x_right] : 0;
 
+            // zero out pixel if disparity is inconsistent
             output[y * width + x] = (std::abs(dl - dr) > CROSSCHECK_THRESHOLD) ? 0 : static_cast<std::uint8_t>(dl);
         }
     }
 }
 
+// fills zero (invalid) pixels by looking at nearest non-zero neighbor on the same row
 void OcclusionFill(const GrayImage &input, GrayImage &output, int width, int height)
 {
     for (int y = 0; y < height; ++y)
@@ -198,6 +205,7 @@ void OcclusionFill(const GrayImage &input, GrayImage &output, int width, int hei
             if (input[y * width + x] == 0)
             {
                 std::uint8_t fill_val = 0;
+                // search left then right for a valid pixel
                 for (int offset = 1; offset < width; ++offset)
                 {
                     if (x - offset >= 0 && input[y * width + (x - offset)] != 0)
@@ -221,6 +229,7 @@ void OcclusionFill(const GrayImage &input, GrayImage &output, int width, int hei
     }
 }
 
+// downscale by 4x and convert to grayscale in one pass
 void ProcessImageSequential(const RGBAImage &input_rgba, int w, int h, GrayImage &output_gray)
 {
     int nw = w / 4, nh = h / 4;
@@ -228,6 +237,7 @@ void ProcessImageSequential(const RGBAImage &input_rgba, int w, int h, GrayImage
     {
         for (int x = 0; x < nw; ++x)
         {
+            // pick the top-left pixel of each 4x4 block
             int idx = ((y * 4 * w) + (x * 4)) * 4;
             float r = input_rgba[idx];
             float g = input_rgba[idx + 1];
@@ -237,6 +247,7 @@ void ProcessImageSequential(const RGBAImage &input_rgba, int w, int h, GrayImage
     }
 }
 
+// normalize disparity to 0-255 range and save as grayscale PNG
 void SaveNormalizedImage(const std::string &filename, const GrayImage &data, int width, int height)
 {
     RGBAImage rgba(width * height * 4);
@@ -270,6 +281,7 @@ int main()
 
     std::cout << "Started" << std::endl;
 
+    // time each stage separately
     auto t0 = std::chrono::high_resolution_clock::now();
 
     ProcessImageSequential(img0_raw, w, h, gray0);
