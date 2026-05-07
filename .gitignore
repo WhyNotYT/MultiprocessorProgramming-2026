@@ -1,3 +1,11 @@
+
+# 1. Ignore everything
+*
+# 2. But don't ignore files that have a dot (an extension)
+!*.*
+# 3. (Optional) Don't ignore directories
+!*/
+
 # Prerequisites
 *.d
 
@@ -67,3 +75,39 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+
+*.txt
+*.pdf
+
+
+.vscode/
+
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+WebGPU/node_modules
+WebGPU/dist
+WebGPU/dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+
+report.MD
