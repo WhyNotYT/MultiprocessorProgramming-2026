@@ -1,3 +1,9 @@
+// Optimized GPU stereo depth map using OpenCL
+// Improvements over main_gpu.cpp:
+//   - split ZNCC into separate left/right kernels (better GPU occupancy)
+//   - two-pass occlusion fill (fill_pass1 + fill_pass2) instead of single-pass
+//   - compiler flags for fast math
+
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -20,11 +26,11 @@
 constexpr int WIN_SIZE = 9;
 constexpr int MAX_DISP = 65;
 constexpr int CROSSCHECK_THRESH = 8;
-constexpr int WG_X = 32;
-constexpr int WG_Y = 8;
-/* OPT-A: fill passes use 1-D workgroups of this size (rows per WG) */
-constexpr int WG_FILL = 64;
+constexpr int WG_X = 32;    // work-group size X for 2D kernels
+constexpr int WG_Y = 8;     // work-group size Y for 2D kernels
+constexpr int WG_FILL = 64; // work-group size for 1D fill kernels (rows per WG)
 
+// fast math flags help the GPU compiler optimize better
 static const char *BUILD_FLAGS =
     "-cl-fast-relaxed-math -cl-mad-enable -cl-no-signed-zeros";
 
@@ -34,6 +40,7 @@ static void cl_die(cl_int e, const char *msg, int line)
               << "  (err=" << e << ")\n";
     std::exit(1);
 }
+// cleaner error check macro with line number
 #define CK(call, msg)                  \
     do                                 \
     {                                  \
@@ -42,6 +49,7 @@ static void cl_die(cl_int e, const char *msg, int line)
             cl_die(_e, msg, __LINE__); \
     } while (0)
 
+// print progress to stdout
 #define STEP(s)                             \
     do                                      \
     {                                       \
@@ -59,6 +67,7 @@ static std::string LoadFile(const std::string &path)
     return ss.str();
 }
 
+// compile kernel source with fast-math flags
 static cl_program BuildProgram(cl_context ctx, cl_device_id dev,
                                const std::string &src)
 {
@@ -94,6 +103,7 @@ static void SaveNormalized(const std::string &fn,
     lodepng::encode(fn, rgba, w, h);
 }
 
+// round n up to nearest multiple of m (for NDRange alignment)
 static size_t RoundUp(size_t n, size_t m) { return ((n + m - 1) / m) * m; }
 
 int main(int, char **)
@@ -114,6 +124,7 @@ int main(int, char **)
               << " -> " << nw << "x" << nh << "\n"
               << std::flush;
 
+    // pick GPU based on USE_IGPU env variable (same logic as main_gpu.cpp)
     STEP("selecting device");
     cl_int err;
     cl_uint np = 0;
@@ -181,8 +192,8 @@ int main(int, char **)
     std::string src = LoadFile("kernels.optimized.cl");
     cl_program prog = BuildProgram(ctx, device, src);
 
-    /* FIX-3 / OPT-A: one object per kernel function.
-     * fill_pass1 + fill_pass2 replace the old single occlusion_fill kernel. */
+    // zncc is now split into two separate kernels for better GPU utilization
+    // fill is now two passes (pass1: left->right, pass2: right->left)
     STEP("creating kernel objects");
     cl_kernel k_resize = clCreateKernel(prog, "resize_image", &err);
     CK(err, "k_resize");
@@ -199,6 +210,7 @@ int main(int, char **)
     cl_kernel k_fp2 = clCreateKernel(prog, "fill_pass2", &err);
     CK(err, "k_fp2");
 
+    // upload full-res images; CL_MEM_COPY_HOST_PTR triggers immediate transfer
     STEP("allocating full-res images on GPU");
     cl_image_format fmt = {CL_RGBA, CL_UNSIGNED_INT8};
     cl_image_desc dfull = {};
@@ -233,36 +245,33 @@ int main(int, char **)
     CK(err, "bdr");
     cl_mem bcc = clCreateBuffer(ctx, CL_MEM_READ_WRITE, small_px, nullptr, &err);
     CK(err, "bcc");
-    /* OPT-A: scratch buffer for fill pass 1 → pass 2 hand-off.
-     * 2 bytes per pixel: [fill_value, distance_to_source].               */
+    // scratch buffer passes fill values + distances from pass1 to pass2 (2 bytes per pixel)
     cl_mem bscratch = clCreateBuffer(ctx, CL_MEM_READ_WRITE, small_px * 2, nullptr, &err);
     CK(err, "bscratch");
     cl_mem bout = clCreateBuffer(ctx, CL_MEM_READ_WRITE, small_px, nullptr, &err);
     CK(err, "bout");
 
-    /* NDRange sizes */
+    // NDRange sizes: round up to work-group boundaries
     size_t gs2[2] = {RoundUp(nw, WG_X), RoundUp(nh, WG_Y)}, ls2[2] = {WG_X, WG_Y};
     size_t gs1[1] = {RoundUp(nh, WG_FILL)}, ls1[1] = {WG_FILL};
 
-    /* 10 events: resize×2, gray×2, zncc×2, cross_check, fill_pass1, fill_pass2 */
     cl_event ev[9] = {};
     auto t_upload_start = std::chrono::high_resolution_clock::now();
-    clFinish(queue); /* wait for image uploads triggered by CL_MEM_COPY_HOST_PTR */
+    clFinish(queue); // wait for image uploads triggered by CL_MEM_COPY_HOST_PTR
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    /* ---- resize img0 ---- */
+    // resize both images
     STEP("enqueue resize img0");
     CK(clSetKernelArg(k_resize, 0, sizeof(cl_mem), &img0f), "resize a0");
     CK(clSetKernelArg(k_resize, 1, sizeof(cl_mem), &img0s), "resize a1");
     CK(clEnqueueNDRangeKernel(queue, k_resize, 2, nullptr, gs2, ls2, 0, nullptr, &ev[0]), "enq res0");
 
-    /* ---- resize img1 – reuse k_resize (FIX-3) ---- */
+    // reuse same kernel object with different args
     STEP("enqueue resize img1");
     CK(clSetKernelArg(k_resize, 0, sizeof(cl_mem), &img1f), "resize a0");
     CK(clSetKernelArg(k_resize, 1, sizeof(cl_mem), &img1s), "resize a1");
     CK(clEnqueueNDRangeKernel(queue, k_resize, 2, nullptr, gs2, ls2, 0, nullptr, &ev[1]), "enq res1");
 
-    /* ---- grayscale img0 ---- */
     STEP("enqueue grayscale img0");
     CK(clSetKernelArg(k_gray, 0, sizeof(cl_mem), &img0s), "gray a0");
     CK(clSetKernelArg(k_gray, 1, sizeof(cl_mem), &bgry0), "gray a1");
@@ -270,7 +279,6 @@ int main(int, char **)
     CK(clSetKernelArg(k_gray, 3, sizeof(int), &nh), "gray a3");
     CK(clEnqueueNDRangeKernel(queue, k_gray, 2, nullptr, gs2, ls2, 0, nullptr, &ev[2]), "enq gry0");
 
-    /* ---- grayscale img1 – reuse k_gray (FIX-3) ---- */
     STEP("enqueue grayscale img1");
     CK(clSetKernelArg(k_gray, 0, sizeof(cl_mem), &img1s), "gray a0");
     CK(clSetKernelArg(k_gray, 1, sizeof(cl_mem), &bgry1), "gray a1");
@@ -278,7 +286,7 @@ int main(int, char **)
     CK(clSetKernelArg(k_gray, 3, sizeof(int), &nh), "gray a3");
     CK(clEnqueueNDRangeKernel(queue, k_gray, 2, nullptr, gs2, ls2, 0, nullptr, &ev[3]), "enq gry1");
 
-    /* ---- zncc_left ---- */
+    // ZNCC left and right are now separate kernels
     STEP("enqueue zncc_left");
     const int win_half = WIN_SIZE / 2, max_disp = MAX_DISP;
     CK(clSetKernelArg(k_znl, 0, sizeof(cl_mem), &bgry0), "znl a0");
@@ -290,7 +298,6 @@ int main(int, char **)
     CK(clSetKernelArg(k_znl, 6, sizeof(int), &max_disp), "znl a6");
     CK(clEnqueueNDRangeKernel(queue, k_znl, 2, nullptr, gs2, ls2, 0, nullptr, &ev[4]), "enq znl");
 
-    /* ---- zncc_right ---- */
     STEP("enqueue zncc_right");
     CK(clSetKernelArg(k_znr, 0, sizeof(cl_mem), &bgry0), "znr a0");
     CK(clSetKernelArg(k_znr, 1, sizeof(cl_mem), &bgry1), "znr a1");
@@ -301,7 +308,6 @@ int main(int, char **)
     CK(clSetKernelArg(k_znr, 6, sizeof(int), &max_disp), "znr a6");
     CK(clEnqueueNDRangeKernel(queue, k_znr, 2, nullptr, gs2, ls2, 0, nullptr, &ev[5]), "enq znr");
 
-    /* ---- cross_check ---- */
     STEP("enqueue cross_check");
     const int cc_thresh = CROSSCHECK_THRESH;
     CK(clSetKernelArg(k_cc, 0, sizeof(cl_mem), &bdl), "cc a0");
@@ -312,7 +318,7 @@ int main(int, char **)
     CK(clSetKernelArg(k_cc, 5, sizeof(int), &cc_thresh), "cc a5");
     CK(clEnqueueNDRangeKernel(queue, k_cc, 2, nullptr, gs2, ls2, 0, nullptr, &ev[6]), "enq cc");
 
-    /* ---- OPT-A: fill_pass1  (left→right, writes scratch) ---- */
+    // pass1: scan left->right, write fill value + distance to scratch buffer
     STEP("enqueue fill_pass1");
     CK(clSetKernelArg(k_fp1, 0, sizeof(cl_mem), &bcc), "fp1 a0");
     CK(clSetKernelArg(k_fp1, 1, sizeof(cl_mem), &bscratch), "fp1 a1");
@@ -320,7 +326,7 @@ int main(int, char **)
     CK(clSetKernelArg(k_fp1, 3, sizeof(int), &nh), "fp1 a3");
     CK(clEnqueueNDRangeKernel(queue, k_fp1, 1, nullptr, gs1, ls1, 0, nullptr, &ev[7]), "enq fp1");
 
-    /* ---- OPT-A: fill_pass2  (right→left, writes bout) ---- */
+    // pass2: scan right->left, pick nearest neighbor (left or right) by distance
     STEP("enqueue fill_pass2");
     CK(clSetKernelArg(k_fp2, 0, sizeof(cl_mem), &bcc), "fp2 a0");
     CK(clSetKernelArg(k_fp2, 1, sizeof(cl_mem), &bscratch), "fp2 a1");
@@ -334,6 +340,7 @@ int main(int, char **)
 
     auto t1 = std::chrono::high_resolution_clock::now();
 
+    // print per-kernel timing from profiling events
     static const char *knames[] = {
         "  Resize im0         ",
         "  Resize im1         ",
@@ -377,6 +384,8 @@ int main(int, char **)
 
     SaveNormalized("depthmap_opencl.png", result, nw, nh);
     std::cout << "Result saved\n";
+
+    // cleanup all OpenCL objects
     clReleaseMemObject(img0f);
     clReleaseMemObject(img1f);
     clReleaseMemObject(img0s);
