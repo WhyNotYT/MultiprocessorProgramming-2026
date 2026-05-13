@@ -6,7 +6,7 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
-#include <chrono>
+#include <sys/time.h>
 #include <algorithm>
 #include <cstdint>
 #include <immintrin.h>
@@ -23,13 +23,13 @@ using f32 = float;
 
 struct Timer
 {
-    std::chrono::high_resolution_clock::time_point t0;
-    void start() { t0 = std::chrono::high_resolution_clock::now(); }
+    struct timeval t0;
+    void start() { gettimeofday(&t0, nullptr); }
     double ms() const
     {
-        return std::chrono::duration<double, std::milli>(
-                   std::chrono::high_resolution_clock::now() - t0)
-            .count();
+        struct timeval t1;
+        gettimeofday(&t1, nullptr);
+        return (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_usec - t0.tv_usec) / 1000.0;
     }
 };
 

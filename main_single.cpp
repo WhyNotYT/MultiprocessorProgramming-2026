@@ -5,7 +5,7 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
-#include <chrono>
+#include <sys/time.h>
 #include <algorithm>
 #include <cstdint>
 #include "lodepng.h"
@@ -282,27 +282,28 @@ int main()
     std::cout << "Started" << std::endl;
 
     // time each stage separately
-    auto t0 = std::chrono::high_resolution_clock::now();
+    struct timeval t0, t1, t2, t3, t4, t5;
+    auto ms = [](struct timeval a, struct timeval b)
+    {
+        return (b.tv_sec - a.tv_sec) * 1000.0 + (b.tv_usec - a.tv_usec) / 1000.0;
+    };
+
+    gettimeofday(&t0, nullptr);
 
     ProcessImageSequential(img0_raw, w, h, gray0);
-    auto t1 = std::chrono::high_resolution_clock::now();
+    gettimeofday(&t1, nullptr);
 
     ProcessImageSequential(img1_raw, w, h, gray1);
-    auto t2 = std::chrono::high_resolution_clock::now();
+    gettimeofday(&t2, nullptr);
 
     CalcZNCC(gray0, gray1, d_left, d_right, nw, nh);
-    auto t3 = std::chrono::high_resolution_clock::now();
+    gettimeofday(&t3, nullptr);
 
     CrossCheck(d_left, d_right, d_cc, nw, nh);
-    auto t4 = std::chrono::high_resolution_clock::now();
+    gettimeofday(&t4, nullptr);
 
     OcclusionFill(d_cc, d_final, nw, nh);
-    auto t5 = std::chrono::high_resolution_clock::now();
-
-    auto ms = [](auto a, auto b)
-    {
-        return std::chrono::duration<double, std::milli>(b - a).count();
-    };
+    gettimeofday(&t5, nullptr);
 
     std::cout << "\nTimings:\n";
     std::cout << "  Resize+Grayscale im0: " << ms(t0, t1) << " ms\n";
